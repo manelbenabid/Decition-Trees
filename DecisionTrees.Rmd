@@ -1,0 +1,402 @@
+```{r}
+setwd("C:/Users/Owner/Desktop/LAU/Fall2022/CSC498H Data Mining")
+```
+
+# Importing libraries
+```{r}
+library(rpart)
+library(rpart.plot)
+library(tidyr)
+library(tidyverse)
+library(dplyr)
+library(caTools)
+library(Hmisc)
+library(randomForest)
+library(ggplot2)
+library(pROC)
+library(ROSE)
+library(ipred) #bagging
+library(Metrics)
+library(caret)
+set.seed(1)
+```
+Loading the dataset
+
+We will use the life expectancy data but instead of predicting the life expectancy, we try to predict the Status variable which takes two levels: Developed , Developing
+
+```{r}
+df <- read.csv("life_expectancy.csv", header=TRUE)
+```
+```{r}
+dim(df)
+```
+
+```{r}
+colnames(df)
+```
+
+We're going to remove the country and the Year
+
+```{r}
+df <- df[ ,-c(1,2)]
+head(df)
+```
+
+```{r}
+df$Status <- factor(df$Status)
+```
+
+
+## Train-test-split
+
+```{r}
+sample = sample.split(df$Status, SplitRatio = .80) 
+train = subset(df, sample==TRUE)
+test = subset(df, sample==FALSE)
+```
+
+```{r}
+life_tree <- rpart(formula = Status ~.,
+                    data = train,
+                   cp = 0.01,
+                    method = "class")
+rpart.plot(life_tree)
+```
+We notice that only 7 out of 18 predictors were chosen by the decision tree according to Gini coefficient with a complexity parameter of 0.01. The smaller the coefficient the more complex the tree.
+
+
+we notice that of all the countries we have 0.01 are estimated to be developed (root).
+
+The first node splits the data on the Income.composition.of.resources  predictor, if the value of the obbservation is >= 0.756 then we go left, of those 100%, 24% meet this criteria, and are given a percentage to which status they belong (I cannot read the numbers it's too blurry).
+
+Going down each node the tree continues that way by splitting on different predictors.
+
+Those were the information presented in the tree.
+
+
+```{r}
+#plotting the complexity parameter
+plotcp(life_tree)
+```
+
+So the way rpart works is that it automatically applies a range of complexity α to perform pruning of the tree. 
+
+Rpart then performs 10-fold cross validation and calculates the error of a given α on the hold-out validation set, then it compares these errors.
+
+In our case, we see diminishing returns after 12 terminal nodes as illustrated in our tree above
+
+###### Let's try a more complex tree
+It is known that simple trees are preferred ver complex trees.
+
+Let's demonstrate that by setting cp = 0 i.e no penalty term and thus we get the full tree.
+```{r}
+full_life_tree <- rpart(formula = Status ~.,
+                    data = train,
+                   control = list(cp = 0, xval = 10),
+                    method = "class")
+plotcp(full_life_tree)
+abline(v = 12, lty = "dashed")
+```
+
+```{r}
+life_tree$cptable
+```
+hence, rpart is performing automated tuning with the optimal subtree of 11 splits and |T| = 12 and cross-validation error of 0.255 (PRESS stat).
+
+Let's try adding additional tuning to improve the performance of the model
+
+## Tuning
+
+For tuning, we will use the control argument to adjust the hyperparameters values: minsplit - minimum number of observations required to attempt a split before it's forced to create a terminal node- and maxdepth - max number of internal nodes between the root node and the terminal node-.
+
+#### Hyperparameter tuning
+
+Instead of manually assessung multiple models for different values of minsplit and maxdepth, we will perfrom a grid search to automatically search across a range of differently tuned models to get the optimal hyperparameter
+
+```{r}
+# minsplit range: (5,0)
+# maxdepth range:(8,15)
+
+hyper_grid <- expand.grid(
+  minsplit = seq(5, 20, 1),
+  maxdepth = seq(8, 15, 1)
+)
+```
+
+
+```{r}
+head(hyper_grid)
+```
+
+```{r}
+#number of combinations
+nrow(hyper_grid)
+```
+
+```{r}
+#we will use a for loop to automate the search through each combination
+#at each iteration we save the model
+
+models <- list()
+
+for (i in 1:nrow(hyper_grid)) {
+  
+  # get minsplit, maxdepth values at row i
+  minsplit <- hyper_grid$minsplit[i]
+  maxdepth <- hyper_grid$maxdepth[i]
+
+  # train a model and store in the list
+  models[[i]] <- rpart(formula = Status ~.,
+                    data = train,
+                   control = list(minsplit=minsplit,maxdepth=maxdepth),
+    method = "class")
+    
+}
+```
+
+Next, we will extract the optimal cp and the minimum error associated with it for each model.
+
+```{r}
+# function to get optimal cp
+get_cp <- function(x) {
+  min    <- which.min(x$cptable[, "xerror"])
+  cp <- x$cptable[min, "CP"] 
+}
+
+# function to get minimum error
+get_min_error <- function(x) {
+  min    <- which.min(x$cptable[, "xerror"])
+  xerror <- x$cptable[min, "xerror"] 
+}
+```
+
+```{r}
+hyper_grid %>%
+  mutate(
+    cp    = purrr::map_dbl(models, get_cp),
+    error = purrr::map_dbl(models, get_min_error)
+    ) %>%
+  arrange(error) %>%
+  top_n(-5, wt = error)
+```
+
+After filtering for the top 5 minimal error values we see that the optimal model makes a slight improvement over our earlier model (xerror of 0.201 versus 0.255).
+
+We use this model as the final model and predict on our test set.
+
+```{r}
+optimal_life_tree <- rpart(formula = Status ~.,
+                    data = train,
+                   control = list(cp = 0.01, minsplit=13, maxdepth=13)
+                   , method = "class")
+```
+
+```{r}
+pred <- predict(optimal_life_tree, newdata = test, type="class")
+```
+
+```{r}
+test$Status <- factor(test$Status)
+```
+
+```{r}
+cm <- confusionMatrix(data=pred, reference = test$Status)
+```
+
+
+```{r}
+cm
+```
+We notice that we have an accuracy of 96.6% and precision of 90%. We conclude from this that the model we trained performed really well.
+
+# Bagging
+
+## Bagging with ipred
+
+To fit the bagged model we use ipred::bagging instead of rpart
+we use coob = TRUE to use Out-Of-Bag sample to estimate the test error.
+
+```{r}
+set.seed(123)
+
+# train bagged model
+bagged_m1 <- bagging(
+  formula = Status ~ .,
+  data    = train,
+  coob    = TRUE
+)
+
+bagged_m1
+```
+The estimate misclassification error is 0.0279 years less than the test error we achieved with our single optimal tree.
+
+It is important to note that the more trees the better (typically). as we add trees, we average over high variance single trees. Hence we see a dramatic reduction in variance (i.e our error). Eventually, the reduction in error will flatline => optimal number of trees to create a stable model.
+
+Bagging performs 25 trees (from bootstrap samples) by default, we may need more tho.
+
+```{r}
+# we will assess the error vs. #of trees
+
+# assess 10-50 bagged trees
+ntree <- 10:100
+
+# create empty vector to store OOB RMSE values
+error.rate <- vector(mode = "numeric", length = length(ntree))
+
+for (i in seq_along(ntree)) {
+  # reproducibility
+  set.seed(123)
+  
+  # perform bagged model
+  model <- bagging(
+  formula = Status ~ .,
+  data    = train,
+  coob    = TRUE,
+  nbagg   = ntree[i]
+)
+  # get OOB error
+  error.rate[i] <- model$err
+}
+
+plot(ntree, error.rate, type = 'l', lwd = 2)
+abline(v = 25, col = "red", lty = "dashed")
+```
+we notice that the misclassification rate differs by 0.01  which is not much for the computational power it requires, let's try to test other methods.
+
+### Bagging with caret
+
+
+```{r}
+# we perform 10-fold cross validation
+
+# Specify 10-fold cross validation
+ctrl <- trainControl(method = "cv",  number = 10) 
+
+# CV bagged model
+bagged_cv <- train(
+  Status ~ .,
+  data = train,
+  method = "treebag",
+  trControl = ctrl,
+  importance = TRUE
+  )
+
+# assess results
+bagged_cv
+```
+
+```{r}
+# plot most important variables
+plot(varImp(bagged_cv), 18)
+```
+We see that the cross-validated model accuracy is 0.977 years. We also assessed the importance of the variables from our model which is assessed by the total amount SSE is decreased by splits over a given predictor, averaged on all trees.
+
+The most important variable in our model is income.composition.of.resources.
+
+```{r}
+pred <- predict(bagged_cv, test, method ="class")
+cm <- confusionMatrix(data=pred, reference = test$Status)
+```
+
+```{r}
+cm
+```
+Comparing this result to the previous model we see that the cross-validated accuracy has been improved to approx 98.2%.
+
+We are satisfied with our results.
+
+
+# Random Forest
+
+```{r}
+library(h2oEnsemble) # an extremely fast java-based platform
+library(ranger)
+```
+
+```{r}
+# for reproduciblity
+set.seed(123)
+
+# default RF model
+rf1 <- randomForest(
+  formula = Status ~ .,
+  data    = train
+)
+
+rf1
+```
+
+
+```{r}
+plot(rf1)
+```
+
+Plotting the OOB sample error rate as we average across more trees shows that it stabilizes around 100 trees and increases slowly to 500.
+
+```{r}
+#which.min(rf1$err.rate[:,1])
+range <- 1:dim(rf1$err.rate)[1]
+mini <- 1
+for(i in range){
+  if(mini > rf1$err.rate[i,1]){
+    mini <- rf1$err.rate[i,1]
+  }
+}
+mini
+```
+
+
+```{r}
+#we will split the training set further to create training and validation set
+
+# create training and validation data 
+set.seed(123)
+valid_split <- sample.split(train$Status, SplitRatio = .80) 
+
+
+# training data
+train_v2 <- subset(train, valid_split==TRUE)
+
+# validation data
+valid <- subset(train, valid_split==FALSE)
+x_test <- valid[, -which(names(valid)== "Status")]
+y_test <- valid$Status
+
+rf_oob_comp <- randomForest(
+  formula = Status ~ .,
+  data    = train_v2,
+  xtest   = x_test,
+  ytest   = y_test
+)
+```
+
+
+```{r}
+rf_oob_comp
+```
+
+
+```{r}
+
+# extract OOB & validation errors
+oob <- rf_oob_comp$err.rate
+validation <- rf_oob_comp$test$err.rate
+
+
+```
+
+```{r}
+plot(rf_oob_comp)
+```
+
+We see that we get the best accuracy when the number of trees are around 50.
+
+
+# Conclusion
+
+We performed classification decision trees, hyperparameter tuning, bagging, and random forest to predict the status of the observation as Developing of Developed.
+
+We obtained the best results using random forest and decision trees with bagging and hyperparameter tuning.
+
+
+
